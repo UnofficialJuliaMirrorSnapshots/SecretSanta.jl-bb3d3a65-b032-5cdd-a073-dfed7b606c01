@@ -1,12 +1,13 @@
 module SecretSanta
 
-using Combinatorics
-using Dates
-using GLPKMathProgInterface
-using JSON
-using JuMP
-using Random
-using SMTPClient
+import Combinatorics
+import Dates
+import GLPK
+import JSON
+import JuMP
+import MathOptInterface
+import Random
+import SMTPClient
 
 struct SecretSantaModel
     model::JuMP.Model
@@ -25,7 +26,7 @@ function SecretSantaModel(data::Dict{String, Any})
     
     # Create arcs for a complete bipartite graph.
     exclude = vcat([[[x["email"], y] for y in x["exclude"]] for x in P]...)
-    A = collect(combinations(N, 2)) # Collect arcs from i to j.
+    A = collect(Combinatorics.combinations(N, 2)) # Collect arcs from i to j.
     A = vcat([reverse(a) for a in A], A) # Concatenate arcs from j to i.
     A = filter(x -> !(x in exclude), A) # Remove excluded arcs.
     A = [(a[1], a[2]) for a in A] # Convert to array of tuples.
@@ -34,24 +35,23 @@ function SecretSantaModel(data::Dict{String, Any})
     A = Random.shuffle(A)
 
     # Create the JuMP model.
-    model = Model(solver = GLPKSolverMIP(msg_lev = 0))
+    model = JuMP.Model(JuMP.with_optimizer(GLPK.Optimizer))
     variables = Dict{Symbol, Any}(:x => nothing)
     constraints = Dict{Symbol, Any}(:out_flow => nothing, :in_flow => nothing)
-    constraints[:out_flow] = Dict{String, ConstraintRef}()
-    constraints[:in_flow] = Dict{String, ConstraintRef}()
+    constraints[:out_flow] = Dict{String, JuMP.ConstraintRef}()
+    constraints[:in_flow] = Dict{String, JuMP.ConstraintRef}()
 
     # Create variables corresponding to arc selection.
-    variables[:x] = @variable(model, [a in A], lowerbound = 0, upperbound = 1,
-                              start = 0, category = :Cont, basename = "x")
+    variables[:x] = JuMP.@variable(model, [a in A], binary=true, base_name="x")
 
     for i in N
         out_arcs = collect(filter(x -> (x[1] == i), A))
-        out_vars = Array{JuMP.Variable}([variables[:x][a] for a in out_arcs])
-        constraints[:out_flow][i] = @constraint(model, sum(out_vars) == 1)
+        out_vars = Array{JuMP.VariableRef}([variables[:x][a] for a in out_arcs])
+        constraints[:out_flow][i] = JuMP.@constraint(model, sum(out_vars) == 1)
 
         in_arcs = collect(filter(x -> (x[2] == i), A))
-        in_vars = Array{JuMP.Variable}([variables[:x][a] for a in in_arcs])
-        constraints[:in_flow][i] = @constraint(model, sum(in_vars) == 1)
+        in_vars = Array{JuMP.VariableRef}([variables[:x][a] for a in in_arcs])
+        constraints[:in_flow][i] = JuMP.@constraint(model, sum(in_vars) == 1)
     end
 
     solution = Dict{String, Any}()
@@ -65,17 +65,17 @@ function build_model(input_path::String)
 end
 
 function solve_model(ssm::SecretSantaModel)
-    status = JuMP.solve(ssm.model)
+    JuMP.optimize!(ssm.model)
 
-    if status == :Optimal
-        A = ssm.variables[:x].indexsets[1]
-        return filter(a -> isapprox(getvalue(ssm.variables[:x][a]), 1.0), A)
+    if JuMP.termination_status(ssm.model) == MathOptInterface.OPTIMAL
+        A = ssm.variables[:x].axes[1]
+        return filter(a -> isapprox(JuMP.value(ssm.variables[:x][a]), 1.0), A)
     else
         error("Secret Santa assignment is not possible. Adjust participants.")
     end
 end
 
-function send_email(ssm::SecretSantaModel, sender::Dict{String,Any}, recipient::Dict{String,Any}, test::Bool = true)
+function send_email(ssm::SecretSantaModel, sender::Dict{String,Any}, recipient::Dict{String,Any}, test::Bool=true)
     # Prepare the subject of the email.
     subject = ssm.data["email"]["subject"]
     recipient_name = recipient["name"]
@@ -101,8 +101,9 @@ function send_email(ssm::SecretSantaModel, sender::Dict{String,Any}, recipient::
     body_io = IOBuffer(body)
 
     # Prepare email sending options.
-    opt = SendOptions(isSSL = true, username = ssm.data["email"]["username"],
-                      passwd = ssm.data["email"]["password"])
+    opt = SMTPClient.SendOptions(isSSL=true,
+                                 username=ssm.data["email"]["username"],
+                                 passwd=ssm.data["email"]["password"])
 
     # Prepare the email.
     server = ssm.data["email"]["smtp_server"]
@@ -113,7 +114,7 @@ function send_email(ssm::SecretSantaModel, sender::Dict{String,Any}, recipient::
 
     if !test
         # Send the email.
-        resp = send(url, rcpt, from, body_io, opt)
+        resp = SMTPClient.send(url, rcpt, from, body_io, opt)
     else
         println("------------------------------------------------------------")
         println("Message to $(sender_name) ($(sender_email))")
@@ -123,7 +124,7 @@ function send_email(ssm::SecretSantaModel, sender::Dict{String,Any}, recipient::
     end
 end
 
-function send_matchings(ssm::SecretSantaModel, solution::Array{Tuple{String, String}, 1}, test::Bool = true)
+function send_matchings(ssm::SecretSantaModel, solution::Array{Tuple{String, String}, 1}, test::Bool=true)
     participants = ssm.data["participants"]
 
     for matching in solution
@@ -133,7 +134,7 @@ function send_matchings(ssm::SecretSantaModel, solution::Array{Tuple{String, Str
     end
 end
 
-function run(input_path::String; test::Bool = true)
+function run(input_path::String; test::Bool=true)
     ssm = build_model(input_path)
     solution = solve_model(ssm)
     send_matchings(ssm, solution, test)
